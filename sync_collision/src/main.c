@@ -1,5 +1,6 @@
+
 /*
- * UART com sincronização por botão
+ * UART com sincronização assíncrona por botão
  * Placa: FRDM-KL25Z
  *
  * PTA16: Botão de sincronização
@@ -17,6 +18,10 @@
 #define UART_DEVICE_NODE DT_CHOSEN(zephyr_shell_uart)
 #define MSG_SIZE 32
 
+#define RX_TX_CHECK_INTERVAL_MS 100  // Checagem do botão a cada 100ms
+#define RX_DURATION_MS 5000          // 5s RX
+#define TX_DURATION_MS 5000          // 5s TX
+
 /* --- Fila de mensagens UART --- */
 K_MSGQ_DEFINE(uart_msgq, MSG_SIZE, 10, 4);
 
@@ -27,14 +32,16 @@ static int rx_buf_pos;
 
 /* --- Botão de sincronização --- */
 const struct device *gpioa_dev = DEVICE_DT_GET(DT_NODELABEL(gpioa));
-#define SYNC_BUTTON_PIN 16   // Alterado de PTA1 para PTA16
+#define SYNC_BUTTON_PIN 16
 static struct gpio_callback button_cb_data;
-K_SEM_DEFINE(sync_button_sem, 0, 1); // semáforo para sincronização
+
+/* --- Semáforo para sinalizar botão --- */
+K_SEM_DEFINE(sync_sem, 0, 1);
 
 /* --- Callback do botão --- */
 void sync_button_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
 {
-    k_sem_give(&sync_button_sem);
+    k_sem_give(&sync_sem);
 }
 
 /* --- ISR UART --- */
@@ -67,11 +74,11 @@ void print_uart(char *buf)
     }
 }
 
-/* --- Função main --- */
+/* --- Função principal --- */
 int main(void)
 {
     char tx_buf[MSG_SIZE];
-    bool start_rx = false; // Determina se inicia com RX ou TX (modifique manualmente na outra placa)
+    bool start_rx = false; // Configure manualmente a outra placa como false
 
     if (!device_is_ready(uart_dev)) {
         printk("UART device not found!\n");
@@ -100,37 +107,72 @@ int main(void)
     gpio_init_callback(&button_cb_data, sync_button_pressed, BIT(SYNC_BUTTON_PIN));
     gpio_add_callback(gpioa_dev, &button_cb_data);
 
-    /* --- Espera o botão para sincronização --- */
-    print_uart("Aguardando botão para sincronização...\r\n");
-    k_sem_take(&sync_button_sem, K_FOREVER);
-
-    if (start_rx) {
-        print_uart("Placa iniciando em MODO RX\n");
-    } else {
-        print_uart("Placa iniciando em MODO TX\n");
-    }
+    /* --- Mensagem inicial --- */
+    print_uart("UART iniciado. Pressione o botão a qualquer momento para sincronizar.\r\n");
 
     /* --- Loop principal RX/TX --- */
     while (1) {
         if (start_rx) {
-            // Modo RX
+            /* --- MODO RX --- */
             k_msgq_purge(&uart_msgq);
             print_uart("Modo RX: acumulando mensagens por 5s...\r\n");
-            k_sleep(K_SECONDS(5));
 
-            // Modo TX
-            print_uart("Modo TX: esvaziando fila...\r\n");
-            while (k_msgq_get(&uart_msgq, &tx_buf, K_NO_WAIT) == 0) {
-                print_uart("Eco: ");
-                print_uart(tx_buf);
-                print_uart("\r\n");
+            int elapsed = 0;
+            while (elapsed < RX_DURATION_MS) {
+                k_sleep(K_MSEC(RX_TX_CHECK_INTERVAL_MS));
+                elapsed += RX_TX_CHECK_INTERVAL_MS;
+
+                // Verifica botão a qualquer momento
+                if (k_sem_count_get(&sync_sem) > 0) {
+                    k_sem_take(&sync_sem, K_NO_WAIT);
+                    print_uart("Botão pressionado! Forçando sincronização...\r\n");
+                    start_rx = true; // ou false na outra placa
+                    break;           // sai do RX imediatamente
+                }
             }
-            k_sleep(K_SECONDS(5));
+
+            /* --- MODO TX --- */
+            print_uart("Modo TX: esvaziando fila...\r\n");
+
+            elapsed = 0;
+            while (elapsed < TX_DURATION_MS) {
+                // Esvazia fila continuamente
+                while (k_msgq_get(&uart_msgq, &tx_buf, K_NO_WAIT) == 0) {
+                    print_uart("Eco: ");
+                    print_uart(tx_buf);
+                    print_uart("\r\n");
+                }
+
+                k_sleep(K_MSEC(RX_TX_CHECK_INTERVAL_MS));
+                elapsed += RX_TX_CHECK_INTERVAL_MS;
+
+                // Verifica botão
+                if (k_sem_count_get(&sync_sem) > 0) {
+                    k_sem_take(&sync_sem, K_NO_WAIT);
+                    print_uart("Botão pressionado! Forçando sincronização...\r\n");
+                    start_rx = true; // ou false na outra placa
+                    break;           // sai do TX imediatamente
+                }
+            }
+
         } else {
-            // Modo TX inicial para sincronização
-            print_uart("Modo TX inicial: esperando 5s...\r\n");
-            k_sleep(K_SECONDS(5));
-            start_rx = true; // depois alterna para RX/TX normal
+            /* --- MODO TX inicial para sincronização --- */
+            print_uart("Modo TX inicial: aguardando 5s...\r\n");
+
+            int elapsed = 0;
+            while (elapsed < TX_DURATION_MS) {
+                k_sleep(K_MSEC(RX_TX_CHECK_INTERVAL_MS));
+                elapsed += RX_TX_CHECK_INTERVAL_MS;
+
+                if (k_sem_count_get(&sync_sem) > 0) {
+                    k_sem_take(&sync_sem, K_NO_WAIT);
+                    print_uart("Botão pressionado durante TX inicial! Forçando sincronização...\r\n");
+                    start_rx = true; // alterna para RX/TX normal
+                    break;
+                }
+            }
+
+            start_rx = true; // depois do primeiro TX inicial, entra no ciclo normal
         }
     }
 
