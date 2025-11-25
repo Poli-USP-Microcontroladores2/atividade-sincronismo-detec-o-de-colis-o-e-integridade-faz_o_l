@@ -1,0 +1,25 @@
+&{/soc} {
+    uart1: uart@4006b000 {
+        compatible = "nxp,kinetis-uart";
+
+        reg = <0x4006b000 0xC>;
+        interrupts = <13 0>;
+        clocks = <&sim 0x0 0x1034 0xb>;
+        pinctrl-0 = <&uart1_default>;
+        pinctrl-names = "default";
+        current-speed = <230400>;
+        clock-frequency = <48000000>;
+        status = "okay";
+    };
+};
+
+&pinctrl {
+    uart1_default: uart1_default {
+        group0 {
+            pinmux = <UART1_TX_PTE0>,
+                     <UART1_RX_PTE1>;
+            drive-strength = "low";
+            slew-rate = "slow";
+        };
+    };
+};
