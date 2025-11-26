@@ -1,15 +1,24 @@
-/*
- * FRDM-KL25Z — Dual-UART, comportamento solicitado
+/* Código final corrigido — UART0 (PC <-> Placa) e UART1 (Placa <-> Placa)
  *
- * UART0 (PC <-> placa):  PTA1 RX, PTA2 TX
- * UART1 (Placa <-> placa): PTE1 RX, PTE0 TX
+ * FRDM-KL25Z:
+ *   UART0 → PC
+ *     RX = PTA1
+ *     TX = PTA2
  *
- * PLATE_A = 1  -> Placa A: PC -> (store in RX) -> TX -> envia via UART1
- * PLATE_A = 0  -> Placa B: UART1 -> (store in RX) -> TX -> envia ao PC
+ *   UART1 → Comunicação entre placas
+ *     RX = PTE1
+ *     TX = PTE0
  *
- * Ciclo contínuo: RX_TIME_MS (5s) -> TX_TIME_MS (5s) -> repete
- * Botão (PTA16) força a placa a entrar no modo determinado por start_rx.
- * Após forçar, a placa continua o ciclo a partir do novo modo (reset do tempo).
+ * Ambas as placas têm ciclo automático de:
+ *     5 s RX -> 5 s TX -> repete
+ *
+ * O botão força entrar no modo preferencial definido pela flag start_rx.
+ * Se start_rx = true  -> força RX
+ * Se start_rx = false -> força TX
+ *
+ * Correção: agora o código usa um estado corrente (RX ou TX). O botão
+ * força o estado para o modo definido por start_rx e o ciclo continua
+ * a partir desse ponto (não retorna para onde parou).
  */
 
 #include <zephyr/kernel.h>
@@ -18,71 +27,36 @@
 #include <zephyr/drivers/gpio.h>
 #include <string.h>
 
-#define PLATE_A 1           /* Defina 1 para PLACA A, 0 para PLACA B */
 #define UART_PC_NODE   DT_NODELABEL(uart0)
 #define UART_LINK_NODE DT_NODELABEL(uart1)
 
-#define MSG_SIZE    64
+#define MSG_SIZE    32
 #define CHECK_MS    100
 #define RX_TIME_MS  5000
 #define TX_TIME_MS  5000
 
-/* Filas */
-K_MSGQ_DEFINE(pc_to_link_q, MSG_SIZE, 10, 4);   /* Mensagens vindas do PC (para enviar no TX - útil para PLATE_A) */
-K_MSGQ_DEFINE(link_to_pc_q, MSG_SIZE, 10, 4);   /* Mensagens vindas da outra placa (para enviar ao PC no TX - útil para PLATE_B) */
+/* Fila para mensagens vindas da outra placa (UART1) */
+K_MSGQ_DEFINE(link_msgq, MSG_SIZE, 10, 4);
 
-/* UART devices */
-static const struct device *const uart_pc   = DEVICE_DT_GET(UART_PC_NODE);   /* UART0 */
-static const struct device *const uart_link = DEVICE_DT_GET(UART_LINK_NODE); /* UART1 */
+/* UART0 = PC */
+static const struct device *const uart_pc   = DEVICE_DT_GET(UART_PC_NODE);
 
-/* buffers de ISR */
-static char pc_rx_buf[MSG_SIZE];
-static int  pc_rx_pos = 0;
+/* UART1 = comunicação entre placas */
+static const struct device *const uart_link = DEVICE_DT_GET(UART_LINK_NODE);
 
-static char link_rx_buf[MSG_SIZE];
-static int  link_rx_pos = 0;
+static char rx_buf[MSG_SIZE];
+static int rx_pos = 0;
 
-/* Botão */
+/* Botão (PTA16) */
 const struct device *gpioa_dev = DEVICE_DT_GET(DT_NODELABEL(gpioa));
 #define SYNC_BUTTON_PIN 16
 static struct gpio_callback button_cb_data;
+
+/* Semáforo sinalizando botão */
 K_SEM_DEFINE(sync_sem, 0, 1);
 
-/* Estado atual do ciclo */
-static bool current_is_rx = true;   /* começa em RX por padrão */
-static bool start_rx = true;        /* preferencia: se true => botão força RX; se false => força TX */
-
-/* ------------------------------------------------------------------ */
-/* UART0 ISR: recebe do PC — aceita SOMENTE se estamos em RX (coleta)   */
-/* ------------------------------------------------------------------ */
-void uart_pc_isr(const struct device *dev, void *user_data)
-{
-    uint8_t c;
-
-    if (!uart_irq_update(uart_pc)) return;
-    if (!uart_irq_rx_ready(uart_pc)) return;
-
-    while (uart_fifo_read(uart_pc, &c, 1) == 1) {
-        if (c == '\n' || c == '\r') {
-            if (pc_rx_pos > 0) {
-                pc_rx_buf[pc_rx_pos] = '\0';
-                /* Só guarda a mensagem se estamos em RX */
-                if (current_is_rx) {
-                    /* Enfileira para ser enviada pela UART_LINK durante o próximo TX (essencialmente Plate A behavior) */
-                    k_msgq_put(&pc_to_link_q, &pc_rx_buf, K_NO_WAIT);
-                }
-                pc_rx_pos = 0;
-            }
-        } else if (pc_rx_pos < (MSG_SIZE - 1)) {
-            pc_rx_buf[pc_rx_pos++] = c;
-        }
-    }
-}
-
-/* ------------------------------------------------------------------ */
-/* UART1 ISR: recebe da outra placa — aceita SOMENTE se estamos em RX  */
-/* ------------------------------------------------------------------ */
-void uart_link_isr(const struct device *dev, void *user_data)
+/* ================= UART1 ISR (entre placas) ================= */
+void link_uart_cb(const struct device *dev, void *user_data)
 {
     uint8_t c;
 
@@ -90,194 +64,151 @@ void uart_link_isr(const struct device *dev, void *user_data)
     if (!uart_irq_rx_ready(uart_link)) return;
 
     while (uart_fifo_read(uart_link, &c, 1) == 1) {
+
         if (c == '\n' || c == '\r') {
-            if (link_rx_pos > 0) {
-                link_rx_buf[link_rx_pos] = '\0';
-                /* Só aceita mensagens do link quando estiver em RX */
-                if (current_is_rx) {
-                    k_msgq_put(&link_to_pc_q, &link_rx_buf, K_NO_WAIT);
-                }
-                link_rx_pos = 0;
+            if (rx_pos > 0) {
+                rx_buf[rx_pos] = '\0';
+                k_msgq_put(&link_msgq, &rx_buf, K_NO_WAIT);
+                rx_pos = 0;
             }
-        } else if (link_rx_pos < (MSG_SIZE - 1)) {
-            link_rx_pos++;
-            link_rx_buf[link_rx_pos - 1] = c;
+        } else if (rx_pos < MSG_SIZE - 1) {
+            rx_buf[rx_pos++] = c;
         }
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* Funções de envio (bloqueantes simples)                             */
-/* ------------------------------------------------------------------ */
+/* UART0 -> PC (print) */
 void pc_print(const char *s)
 {
     while (*s) uart_poll_out(uart_pc, *s++);
 }
 
+/* UART1 -> outra placa (envio) */
 void link_send(const char *s)
 {
     while (*s) uart_poll_out(uart_link, *s++);
 }
 
-/* ------------------------------------------------------------------ */
-/* Botão callback                                                     */
-/* ------------------------------------------------------------------ */
+/* Botão ISR */
 void sync_button_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
 {
-    /* sinaliza que o botão foi pressionado */
     k_sem_give(&sync_sem);
 }
 
 /* ------------------------------------------------------------------ */
-/* MAIN                                                                 */
+/* MAIN corrigido: usa máquina de estado simples (RX/TX)              */
 /* ------------------------------------------------------------------ */
+
 int main(void)
 {
-    char tmp[MSG_SIZE];
+    char msg[MSG_SIZE];
 
-    /* Ajuste manual: qual modo o botão deve forçar? */
-#if PLATE_A
-    /* Para PLACA A: o fluxo típico é PC -> (armazenar em RX) -> TX -> enviar via link */
-    start_rx = true;   /* Exemplo: botão força RX (ajuste se quiser) */
-#else
-    /* Para PLACA B: o fluxo típico é receber pelo link em RX e depois enviar ao PC em TX */
-    start_rx = true;   /* ajuste conforme preferir */
-#endif
+    /* <-- ajuste manual em cada placa --> */
+    bool start_rx = true;  /* se true: preferencial RX; se false: preferencial TX */
 
-    /* Verifica UARTs */
+    /* estado corrente (inicia conforme start_rx) */
+    enum { MODE_RX = 0, MODE_TX = 1 } ;
+    int current_mode = start_rx ? MODE_RX : MODE_TX;
+
+    /* validações iniciais */
     if (!device_is_ready(uart_pc)) {
-        /* Se não estiver pronto, não prosseguir */
+        /* Não conseguimos imprimir no PC, mas retornamos para travar */
         return 0;
     }
     if (!device_is_ready(uart_link)) {
+        pc_print("UART de link não pronta!\r\n");
         return 0;
     }
 
-    /* Configura ISRs */
-    uart_irq_callback_user_data_set(uart_pc, uart_pc_isr, NULL);
-    uart_irq_rx_enable(uart_pc);
-
-    uart_irq_callback_user_data_set(uart_link, uart_link_isr, NULL);
+    /* ativa ISR da UART1 (link) */
+    uart_irq_callback_user_data_set(uart_link, link_uart_cb, NULL);
     uart_irq_rx_enable(uart_link);
 
-    /* Configura botão */
+    /* configura botão */
     if (!device_is_ready(gpioa_dev)) {
+        pc_print("GPIOA não pronto!\r\n");
         return 0;
     }
-
     gpio_pin_configure(gpioa_dev, SYNC_BUTTON_PIN, GPIO_INPUT | GPIO_PULL_UP);
     gpio_pin_interrupt_configure(gpioa_dev, SYNC_BUTTON_PIN, GPIO_INT_EDGE_TO_ACTIVE);
     gpio_init_callback(&button_cb_data, sync_button_pressed, BIT(SYNC_BUTTON_PIN));
     gpio_add_callback(gpioa_dev, &button_cb_data);
 
     pc_print("Sistema iniciado.\r\n");
-#if PLATE_A
-    pc_print("PLATE_A: comportamento PC -> link\n");
-#else
-    pc_print("PLATE_B: comportamento link -> PC\n");
-#endif
+    pc_print(start_rx ? "Modo preferencial: RX\r\n" : "Modo preferencial: TX\r\n");
 
-    /* Inicia ciclo em RX */
-    current_is_rx = true;
-    int elapsed = 0;
-
+    /* loop principal com máquina de estados */
     while (1) {
-        /* Se o botão for pressionado: força o modo definido por start_rx e reinicia o contador */
-        if (k_sem_take(&sync_sem, K_NO_WAIT) == 0) {
-            current_is_rx = start_rx;
-            elapsed = 0;
-            if (current_is_rx) pc_print("[BOTAO] Forcado: RX\n");
-            else                pc_print("[BOTAO] Forcado: TX\n");
-            /* continua no novo modo imediatamente */
-        }
 
-        if (current_is_rx) {
-            /* MODO RX: coleta mensagens (ISRs já enfileiram quando em RX) */
-            pc_print(">> MODO RX ativo\n");
+        if (current_mode == MODE_RX) {
+            pc_print(">> Entrando no modo RX...\r\n");
+            k_msgq_purge(&link_msgq); /* opcional: limpar buffer no início do RX */
 
-            /* Durante RX, imprime no PC o que foi recebido do link (apenas se houver) */
-            int loop_ms = 0;
-            while (loop_ms < RX_TIME_MS) {
-                /* se botão pressionado, forçar novo modo e reiniciar */
+            int elapsed = 0;
+            while (elapsed < RX_TIME_MS) {
+
+                /* botão pressionado: força para o modo desejado (start_rx) */
                 if (k_sem_take(&sync_sem, K_NO_WAIT) == 0) {
-                    current_is_rx = start_rx;
-                    elapsed = 0;
-                    if (current_is_rx) pc_print("[BOTAO] Forcado: RX\n");
-                    else                pc_print("[BOTAO] Forcado: TX\n");
-                    break; /* sai RX e continua no novo modo */
+                    if (start_rx) {
+                        pc_print("Botão pressionado -> Forçando RX (modo preferido).\r\n");
+                        current_mode = MODE_RX; /* já está em RX, mantemos */
+                    } else {
+                        pc_print("Botão pressionado -> Forçando TX (modo preferido).\r\n");
+                        current_mode = MODE_TX; /* salta imediatamente para TX */
+                    }
+                    goto next_state; /* sai do período atual e aplica novo estado */
                 }
 
-                /* Para PLATE_B: mensagens vindas do link são enfileiradas em link_to_pc_q dentro do ISR
-                 * Exibimos (ou apenas confirmamos) para o PC local */
-                while (k_msgq_get(&link_to_pc_q, &tmp, K_NO_WAIT) == 0) {
-                    /* PARA PLATE_B: recebemos dado da outra placa enquanto estamos em RX */
-                    pc_print("[RX->PC_QUEUE] "); pc_print(tmp); pc_print("\r\n");
-                }
-
-                /* Para PLATE_A: mensagens vindas do PC são enfileiradas em pc_to_link_q dentro do ISR
-                 * Aqui poderíamos confirmar recebimento ao PC, se desejado. */
-                while (k_msgq_get(&pc_to_link_q, &tmp, K_NO_WAIT) == 0) {
-                    /* PLATE_A recebeu algo do PC enquanto em RX; deixamos a fila para enviar quando entrarmos em TX */
-                    pc_print("[PC->STORE] "); pc_print(tmp); pc_print("\r\n");
-                    /* re-enfileira: como pegamos da fila para mostrar, colocamos de volta */
-                    k_msgq_put(&pc_to_link_q, &tmp, K_NO_WAIT);
-                    break; /* mostramos apenas o item do momento */
-                }
-
-                k_sleep(K_MSEC(CHECK_MS));
-                loop_ms += CHECK_MS;
-            }
-
-            /* terminou periodo RX sem interrupção: passa a TX */
-            if (loop_ms >= RX_TIME_MS) {
-                current_is_rx = false;
-                elapsed = 0;
-            }
-        } else {
-            /* MODO TX: envia as mensagens armazenadas de acordo com o papel da placa */
-            pc_print(">> MODO TX ativo\n");
-
-            int loop_ms = 0;
-            while (loop_ms < TX_TIME_MS) {
-                /* botão -> força */
-                if (k_sem_take(&sync_sem, K_NO_WAIT) == 0) {
-                    current_is_rx = start_rx;
-                    elapsed = 0;
-                    if (current_is_rx) pc_print("[BOTAO] Forcado: RX\n");
-                    else                pc_print("[BOTAO] Forcado: TX\n");
-                    break; /* sai TX e vai ao modo forçado */
-                }
-
-#if PLATE_A
-                /* PLACA A: enviar para a outra placa tudo que foi recebido do PC durante RX */
-                while (k_msgq_get(&pc_to_link_q, &tmp, K_NO_WAIT) == 0) {
-                    /* envia via UART1 */
-                    link_send(tmp);
-                    link_send("\r\n");
-                    pc_print("[TX->LINK] "); pc_print(tmp); pc_print("\r\n");
-                }
-#else
-                /* PLACA B: enviar para o PC tudo que foi recebido da outra placa durante RX */
-                while (k_msgq_get(&link_to_pc_q, &tmp, K_NO_WAIT) == 0) {
-                    /* envia via UART0 (PC) */
-                    pc_print(tmp);
+                /* imprime no PC tudo que recebeu da outra placa (se houver) */
+                while (k_msgq_get(&link_msgq, &msg, K_NO_WAIT) == 0) {
+                    pc_print("[RX] ");
+                    pc_print(msg);
                     pc_print("\r\n");
-                    pc_print("[TX->PC] "); pc_print(tmp); pc_print("\r\n");
                 }
-#endif
 
-                /* Se não houve mensagens, ainda dormimos pequenos intervalos para checar botão */
                 k_sleep(K_MSEC(CHECK_MS));
-                loop_ms += CHECK_MS;
+                elapsed += CHECK_MS;
             }
 
-            /* terminou TX sem interrupção: passa a RX */
-            if (loop_ms >= TX_TIME_MS) {
-                current_is_rx = true;
-                elapsed = 0;
-            }
+            /* tempo RX aí acabou normalmente; passa para TX */
+            current_mode = MODE_TX;
         }
+
+        else { /* MODE_TX */
+            pc_print(">> Entrando no modo TX...\r\n");
+
+            int elapsed = 0;
+            while (elapsed < TX_TIME_MS) {
+
+                /* botão pressionado: força para o modo desejado (start_rx) */
+                if (k_sem_take(&sync_sem, K_NO_WAIT) == 0) {
+                    if (start_rx) {
+                        pc_print("Botão pressionado -> Forçando RX (modo preferido).\r_print");
+                        /* se preferir RX, muda agora para RX */
+                        current_mode = MODE_RX;
+                    } else {
+                        pc_print("Botão pressionado -> Forçando TX (modo preferido).\r\n");
+                        current_mode = MODE_TX; /* já está em TX, mantemos */
+                    }
+                    goto next_state; /* sai do período atual e aplica novo estado */
+                }
+
+                /* envio periódico ao link (ou esvaziar fila PC->link se implementar) */
+                link_send("PING\r\n");
+
+                k_sleep(K_MSEC(CHECK_MS));
+                elapsed += CHECK_MS;
+            }
+
+            /* tempo TX acabou normalmente; passa para RX */
+            current_mode = MODE_RX;
+        }
+
+    next_state:
+        /* continue imediatamente com o novo estado no loop (sem voltar ao ponto anterior) */
+        continue;
     }
 
+    /* nunca alcança */
     return 0;
 }
