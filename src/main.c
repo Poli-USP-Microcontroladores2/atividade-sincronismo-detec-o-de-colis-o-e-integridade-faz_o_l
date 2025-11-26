@@ -9,13 +9,11 @@
  *     RX = PTE1
  *     TX = PTE0
  *
- * Ambas as placas têm ciclo automático de:
+ * Ambas as placas têm ciclo automático:
  *     5 s RX → 5 s TX → repete
  *
- * O botão força entrar no modo preferencial definido pela flag start_rx.
- * Se start_rx = true  → força RX
- * Se start_rx = false → força TX
- *
+ * O botão interrompe o ciclo atual e força entrar no modo definido por start_rx.
+ * Após forçar, o ciclo recomeça a partir desse modo escolhido.
  */
 
 #include <zephyr/kernel.h>
@@ -51,7 +49,7 @@ static struct gpio_callback button_cb_data;
 
 K_SEM_DEFINE(sync_sem, 0, 1);
 
-/* ================= UART1 ISR (entre placas) ================= */
+/* UART1 ISR */
 void link_uart_cb(const struct device *dev, void *user_data)
 {
     uint8_t c;
@@ -67,7 +65,8 @@ void link_uart_cb(const struct device *dev, void *user_data)
                 k_msgq_put(&link_msgq, &rx_buf, K_NO_WAIT);
                 rx_pos = 0;
             }
-        } else if (rx_pos < MSG_SIZE - 1) {
+        } 
+        else if (rx_pos < MSG_SIZE - 1) {
             rx_buf[rx_pos++] = c;
         }
     }
@@ -79,13 +78,13 @@ void pc_print(const char *s)
     while (*s) uart_poll_out(uart_pc, *s++);
 }
 
-/* UART1 → outra placa */
+/* UART1 → placa remota */
 void link_send(const char *s)
 {
     while (*s) uart_poll_out(uart_link, *s++);
 }
 
-/* Botão */
+/* Botão ISR */
 void sync_button_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
 {
     k_sem_give(&sync_sem);
@@ -100,13 +99,12 @@ int main(void)
     char msg[MSG_SIZE];
 
     /*
-     * Configure manualmente:
-     *   true  → esta placa prefere RX
-     *   false → esta placa prefere TX
+     * true  → a placa prefere RX quando o botão for pressionado
+     * false → prefere TX
      */
     bool start_rx = true;
 
-    /* UARTs */
+    /* Inicialização UARTs */
     if (!device_is_ready(uart_pc))   return 0;
     if (!device_is_ready(uart_link)) return 0;
 
@@ -122,92 +120,68 @@ int main(void)
     pc_print("Sistema iniciado.\r\n");
     pc_print(start_rx ? "Modo preferencial: RX\r\n" : "Modo preferencial: TX\r\n");
 
+    /* Estado atual do ciclo */
+    enum { MODE_RX, MODE_TX } mode = MODE_RX;
+
     while (1) {
 
         /* ====================================================== */
         /* ======================== RX ========================== */
         /* ====================================================== */
+        if (mode == MODE_RX) {
 
-        pc_print(">> Entrando no modo RX...\r\n");
-        k_msgq_purge(&link_msgq);
+            pc_print(">> Entrando no modo RX...\r\n");
+            k_msgq_purge(&link_msgq);
 
-        int elapsed = 0;
-        while (elapsed < RX_TIME_MS) {
+            int elapsed = 0;
+            while (elapsed < RX_TIME_MS) {
 
-            /* Botão pressionado → força modo preferido */
-            if (k_sem_take(&sync_sem, K_NO_WAIT) == 0) {
-                if (start_rx) pc_print("Botão pressionado → Forçando RX.\r\n");
-                else          pc_print("Botão pressionado → Forçando TX.\r\n");
-                goto forced_mode;
+                /* Botão → força modo preferido e reinicia o ciclo */
+                if (k_sem_take(&sync_sem, K_NO_WAIT) == 0) {
+                    mode = start_rx ? MODE_RX : MODE_TX;
+                    pc_print("Botão pressionado → Reiniciando ciclo em ");
+                    pc_print(start_rx ? "RX\r\n" : "TX\r\n");
+                    break;
+                }
+
+                while (k_msgq_get(&link_msgq, &msg, K_NO_WAIT) == 0) {
+                    pc_print("[RX] "); pc_print(msg); pc_print("\r\n");
+                }
+
+                k_sleep(K_MSEC(CHECK_MS));
+                elapsed += CHECK_MS;
             }
 
-            /* Recebimentos da outra placa */
-            while (k_msgq_get(&link_msgq, &msg, K_NO_WAIT) == 0) {
-                pc_print("[RX] ");
-                pc_print(msg);
-                pc_print("\r\n");
-            }
-
-            k_sleep(K_MSEC(CHECK_MS));
-            elapsed += CHECK_MS;
+            if (elapsed >= RX_TIME_MS)
+                mode = MODE_TX;
         }
 
         /* ====================================================== */
         /* ======================== TX ========================== */
         /* ====================================================== */
+        else {
 
-        pc_print(">> Entrando no modo TX...\r\n");
+            pc_print(">> Entrando no modo TX...\r\n");
 
-        elapsed = 0;
-        while (elapsed < TX_TIME_MS) {
+            int elapsed = 0;
+            while (elapsed < TX_TIME_MS) {
 
-            if (k_sem_take(&sync_sem, K_NO_WAIT) == 0) {
-                if (start_rx) pc_print("Botão pressionado → Forçando RX.\r\n");
-                else          pc_print("Botão pressionado → Forçando TX.\r\n");
-                goto forced_mode;
-            }
-
-            link_send("PING\r\n");
-
-            k_sleep(K_MSEC(CHECK_MS));
-            elapsed += CHECK_MS;
-        }
-
-        continue;
-
-        /* ====================================================== */
-        /* ========== MODO FORÇADO PELO BOTÃO =================== */
-        /* ====================================================== */
-forced_mode:
-
-        if (start_rx) {
-
-            /* Forçar RX */
-            pc_print(">> MODO FORÇADO: RX\r\n");
-            k_msgq_purge(&link_msgq);
-
-            int i;
-            for (i = 0; i < RX_TIME_MS; i += CHECK_MS) {
-
-                while (k_msgq_get(&link_msgq, &msg, K_NO_WAIT) == 0) {
-                    pc_print("[RX] ");
-                    pc_print(msg);
-                    pc_print("\r\n");
+                /* Botão → força modo preferido e reinicia ciclo */
+                if (k_sem_take(&sync_sem, K_NO_WAIT) == 0) {
+                    mode = start_rx ? MODE_RX : MODE_TX;
+                    pc_print("Botão pressionado → Reiniciando ciclo em ");
+                    pc_print(start_rx ? "RX\r\n" : "TX\r\n");
+                    break;
                 }
 
-                k_sleep(K_MSEC(CHECK_MS));
-            }
-
-        } else {
-
-            /* Forçar TX */
-            pc_print(">> MODO FORÇADO: TX\r\n");
-
-            int i;
-            for (i = 0; i < TX_TIME_MS; i += CHECK_MS) {
                 link_send("PING\r\n");
+
                 k_sleep(K_MSEC(CHECK_MS));
+                elapsed += CHECK_MS;
             }
+
+            if (elapsed >= TX_TIME_MS)
+                mode = MODE_RX;
         }
     }
 
