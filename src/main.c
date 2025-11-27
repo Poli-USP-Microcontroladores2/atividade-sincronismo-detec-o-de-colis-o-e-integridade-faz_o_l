@@ -2,90 +2,62 @@
 #include <zephyr/sys/printk.h>
 #include <zephyr/drivers/uart.h>
 
-/* Define os nós dos dispositivos UART */
-#define UART0_NODE DT_CHOSEN(zephyr_console) // Geralmente a UART de console
-#define UART1_NODE DT_NODELABEL(uart1)      // UART de comunicação inter-placa
-
-/* Tamanho do buffer para leitura de dados em cada interrupção */
-#define RX_BUF_SIZE 64
-
-/**
- * @brief Função de callback para interrupções UART.
- *
- * Esta função é chamada sempre que ocorre um evento em UART0 ou UART1.
- * Ela lida com a retransmissão bidirecional.
+/*
+ * Define os nós dos dispositivos UART.
+ * A UART0 é geralmente a porta do console.
+ * NOTE: DT_CHOSEN(zephyr_console) é o método recomendado para o console.
  */
-static void uart_bridge_callback(const struct device *dev, void *user_data)
-{
-    uint8_t buffer[RX_BUF_SIZE];
-    int len;
-
-    // Obtém os ponteiros para os dispositivos UART
-    const struct device *uart0 = DEVICE_DT_GET(UART0_NODE);
-    const struct device *uart1 = DEVICE_DT_GET(UART1_NODE);
-    const struct device *dest_dev = NULL;
-
-    // 1. Determina a UART de destino (o oposto da UART que gerou a interrupção)
-    if (dev == uart0) {
-        // Interrupção veio da UART0 (PC). O destino é a UART1 (Outra Placa).
-        dest_dev = uart1;
-    } else if (dev == uart1) {
-        // Interrupção veio da UART1 (Outra Placa). O destino é a UART0 (PC/Console).
-        dest_dev = uart0;
-    } else {
-        return; // Dispositivo desconhecido, ignora.
-    }
-
-    // 2. Verifica se a interrupção é de "Dados Prontos para Receber"
-    if (uart_irq_rx_ready(dev)) {
-        // Lê os dados da FIFO da UART de origem
-        len = uart_fifo_read(dev, buffer, sizeof(buffer));
-
-        if (len > 0) {
-            // Retransmite os dados lidos para a UART de destino
-            uart_fifo_fill(dest_dev, buffer, len);
-        }
-    }
-
-    // 3. (Opcional) Verifica se a interrupção é de "FIFO de Transmissão Vazia"
-    // Isso é útil se estivéssemos enviando grandes blocos de dados.
-    if (uart_irq_tx_ready(dev)) {
-        // Não há ação de TX complexa aqui, apenas ignoramos ou limpamos a flag
-    }
-}
-
+#define UART0_NODE DT_CHOSEN(zephyr_console)
+#define UART1_NODE DT_NODELABEL(uart1)
 
 void main(void)
 {
+    /* Obtém as instâncias dos dispositivos UART */
     const struct device *uart0 = DEVICE_DT_GET(UART0_NODE);
     const struct device *uart1 = DEVICE_DT_GET(UART1_NODE);
 
     /* --- Checagem de prontidão --- */
     if (!device_is_ready(uart0)) {
-        printk("Erro: UART0 não está pronta!\n");
+        printk("Erro: UART0 (Console) não está pronta!\n");
         return;
-    } else {
-        printk("SUCESSO: UART0 (Console) pronta.\n");
     }
 
     if (!device_is_ready(uart1)) {
-        printk("Erro: UART1 não está pronta! (Verifique Device Tree)\n");
+        printk("Erro: UART1 (Inter-Placa) não está pronta! Verifique o Device Tree (.dts/.overlay).\n");
         return;
-    } else {
-        printk("SUCESSO: UART1 (Inter-Placa) pronta.\n");
     }
 
-    printk("Registrando callbacks...\n");
-    
-    /* --- Configuração da UART0 --- */
-    uart_irq_callback_set(uart0, uart_bridge_callback);
-    uart_irq_rx_enable(uart0);
-    printk("UART0 RX habilitada.\n");
+    printk("Bridge UART0 <-> UART1 ativada! Qualquer dado será retransmitido.\n");
+    printk("-----------------------------------------------------------------\n");
 
-    /* --- Configuração da UART1 --- */
-    uart_irq_callback_set(uart1, uart_bridge_callback);
-    uart_irq_rx_enable(uart1);
-    printk("UART1 RX habilitada.\n");
+    /* --- Loop Principal de Retransmissão Bidirecional --- */
+    while (1) {
+        uint8_t c;
 
-    // ... (restante do código)
+        /*
+         * PARTE 1: Retransmite dados da UART0 (PC) para a UART1 (Outra Placa)
+         */
+        // Tenta ler um caractere da UART0
+        if (uart_poll_in(uart0, &c) == 0) {
+            // Se ler com sucesso (código de retorno 0), envia para a UART1
+            uart_poll_out(uart1, c);
+        }
+
+        /*
+         * PARTE 2: Retransmite dados da UART1 (Outra Placa) para a UART0 (PC/Console)
+         */
+        // Tenta ler um caractere da UART1
+        if (uart_poll_in(uart1, &c) == 0) {
+            // Se ler com sucesso, envia para a UART0 (que é o console printk)
+            uart_poll_out(uart0, c);
+        }
+
+        /*
+         * Usa k_yield() para permitir que outras threads sejam executadas.
+         * Embora k_sleep(K_MSEC(1)) funcione, k_yield() é preferível em
+         * loops de polling de alta frequência para evitar o desperdício de tempo
+         * de CPU enquanto espera por E/S lenta.
+         */
+        k_yield();
+    }
 }
