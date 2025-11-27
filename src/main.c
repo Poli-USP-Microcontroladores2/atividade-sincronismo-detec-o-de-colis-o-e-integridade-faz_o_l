@@ -102,7 +102,7 @@ int main(void)
     uint8_t c;
 
     /* true → prefere RX (receber da outra placa) quando o botão for pressionado */
-    bool start_rx = true; 
+    bool start_rx = false; 
     
     /* Inicialização (Inalterado) */
     if (!device_is_ready(uart_pc))   return 0;
